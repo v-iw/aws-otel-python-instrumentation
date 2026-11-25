@@ -4,6 +4,7 @@
 patches: the decisions it makes in a process started the way the operator starts it."""
 
 import re
+import subprocess
 import sys
 
 import pytest
@@ -185,3 +186,74 @@ def test_skip_without_the_hooks_still_warns_without_the_arguments(payload):
     assert _bundle_entries(state, payload) == []
     assert "cannot auto-instrument Python process: error when importing/initializing" in stderr
     assert "s3cr3t" not in stderr
+
+
+# ADOT patch 0005, package grouping (B2): an application that pins its own urllib3 (requests 2.31 with urllib3 1.26.20)
+# got the payload's urllib3 2.x instead, which broke it on every Python, and crashed it on Python 3.9.
+def test_general_libraries_come_after_the_applications_packages(payload):
+    state, _ = run_python(operator_pythonpath(payload))
+    assert state["sys_path"][-1] == str(payload / "deps")
+    assert state["sys_path"].index(str(payload)) < _first_site_packages_index(state)
+    assert _first_site_packages_index(state) < len(state["sys_path"]) - 1
+
+
+def _import_urllib3(payload, *application_entries):
+    script = "import json, urllib3; print('STATE ' + json.dumps(urllib3.SOURCE))"
+    pythonpath = operator_pythonpath(payload) + "".join(":" + str(entry) for entry in application_entries)
+    return run_python(pythonpath, script=script)[0]
+
+
+def test_application_keeps_its_own_general_library(payload, tmp_path):
+    # Appended after the payload, which is where the application's site-packages are.
+    application = tmp_path / "application-site-packages"
+    write_distribution(
+        application, "urllib3-1.26.20", "urllib3", "1.26.20", {"urllib3/__init__.py": "SOURCE = 'application'\n"}
+    )
+    assert _import_urllib3(payload, application) == "application"
+
+
+def test_general_library_the_application_lacks_comes_from_the_payload(payload):
+    assert _import_urllib3(payload) == "payload"
+
+
+def test_application_pinning_urllib3_1_26_keeps_it_and_is_instrumented(real_payload, tmp_path):
+    application = tmp_path / "application-site-packages"
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--target", str(application),
+         "requests==2.31.0", "urllib3==1.26.20"],
+        check=True, capture_output=True, text=True,
+    )  # fmt: skip
+    script = (
+        "import json, requests, urllib3; print('STATE ' + json.dumps({"
+        "'urllib3': [urllib3.__version__, urllib3.__file__], 'requests': requests.__version__, "
+        "'instrumented': hasattr(requests.Session.send, '__wrapped__')}))"
+    )
+    state, stderr = run_python(
+        operator_pythonpath(real_payload) + ":" + str(application),
+        {"OTEL_TRACES_EXPORTER": "none", "OTEL_METRICS_EXPORTER": "none", "OTEL_LOGS_EXPORTER": "none"},
+        script=script,
+    )
+    assert state["urllib3"] == ["1.26.20", str(application / "urllib3" / "__init__.py")]
+    assert state["requests"] == "2.31.0"
+    assert state["instrumented"]
+    assert "[aws-instrumentation]" not in stderr
+
+
+def test_application_moving_its_packages_forward_later_keeps_our_opentelemetry(real_payload, tmp_path):
+    # ADOT patch 0005 pins the opentelemetry namespace: an application that puts its own site-packages first after
+    # startup would otherwise get every opentelemetry module not imported yet from its own copies.
+    application = tmp_path / "application-site-packages"
+    marker = application / "opentelemetry" / "propagators" / "ot_trace" / "__init__.py"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("SOURCE = 'application'\n")
+    script = (
+        f"import json, sys; sys.path.insert(0, {str(application)!r}); "
+        "import opentelemetry.propagators.ot_trace as ot_trace; "
+        "print('STATE ' + json.dumps(ot_trace.__file__))"
+    )
+    location, _ = run_python(
+        operator_pythonpath(real_payload),
+        {"OTEL_TRACES_EXPORTER": "none", "OTEL_METRICS_EXPORTER": "none", "OTEL_LOGS_EXPORTER": "none"},
+        script=script,
+    )
+    assert location.startswith(str(real_payload) + "/")

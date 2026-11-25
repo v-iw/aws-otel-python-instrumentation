@@ -12,6 +12,9 @@
 #       adot_sitecustomize.py, replacing upstream's.
 #   <payload>/_adot_hooks.py
 #       adot_hooks.py, which patch 0004 calls: the skip record, and the teardown after a failed initialization.
+#   <payload>/deps/
+#       Every distribution that is not OpenTelemetry's or the ADOT distro's, moved out of the payload root so that the
+#       bootstrap can put it behind the application's site-packages (package grouping, patch 0005).
 #   <payload>/cp3<minor>/all-dependencies.txt, for every supported minor
 #       The payload's OpenTelemetry distributions, pinned, for the bootstrap's dependency-conflict check.
 #
@@ -37,6 +40,7 @@ fi
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+
 
 python3 - "$here/vendor/sitecustomize.py" "$UPSTREAM_SHA256" <<'EOF'
 import hashlib, sys
@@ -65,6 +69,56 @@ if len(pattern.findall(text)) != 1:
 text = pattern.sub("_SUPPORTED_PYTHON_MINORS = (%s,)  # supported-python-minors" % ", ".join(minors), text)
 with open(path, "w", encoding="utf-8") as f:
     f.write(text)
+EOF
+
+# Package grouping (B2): every distribution that is not OpenTelemetry's or the ADOT distro's moves to <payload>/deps,
+# which the bootstrap (patch 0005) puts at the end of sys.path, behind the application's site-packages. The
+# OpenTelemetry group stays at the payload root, where the operator's PYTHONPATH puts it, ahead of them. Top-level
+# entries move whole, so that files a RECORD does not list (compiled caches) go with their package; an entry that
+# belongs to both groups cannot be split and fails the build.
+python3 - "$payload" <<'EOF'
+import os, re, shutil, sys
+payload = sys.argv[1]
+deps = os.path.join(payload, "deps")
+owners = {}
+for entry in sorted(os.listdir(payload)):
+    if not entry.endswith(".dist-info"):
+        continue
+    name = None
+    with open(os.path.join(payload, entry, "METADATA"), encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("Name: "):
+                name = line[len("Name: "):].strip()
+                break
+            if not line.strip():
+                break
+    if not name:
+        sys.exit("%s: no Name in METADATA" % entry)
+    normalized = re.sub(r"[-_.]+", "-", name).lower()
+    group = "otel" if normalized.startswith("opentelemetry-") or normalized == "aws-opentelemetry-distro" else "deps"
+    record = os.path.join(payload, entry, "RECORD")
+    if not os.path.isfile(record):
+        sys.exit("%s: no RECORD, so its files cannot be grouped" % entry)
+    tops = {entry}
+    with open(record, encoding="utf-8") as f:
+        for line in f:
+            path = line.rsplit(",", 2)[0].strip()
+            # Scripts are recorded outside the payload (../../bin/...); they stay where pip put them.
+            if path and not path.startswith("..") and not os.path.isabs(path):
+                tops.add(path.split("/")[0])
+    for top in tops:
+        owners.setdefault(top, set()).add(group)
+shared = sorted(top for top, groups in owners.items() if len(groups) > 1)
+if shared:
+    sys.exit("cannot group the payload: %s belong to both OpenTelemetry and general distributions" % ", ".join(shared))
+moving = sorted(top for top, groups in owners.items() if groups == {"deps"} and os.path.lexists(os.path.join(payload, top)))
+if moving:
+    os.makedirs(deps, exist_ok=True)
+for top in moving:
+    target = os.path.join(deps, top)
+    if os.path.lexists(target):
+        sys.exit("%s: already exists" % target)
+    shutil.move(os.path.join(payload, top), target)
 EOF
 
 install -m 0644 "$work/sitecustomize.py" "$payload/_otel_packaging_sitecustomize.py"

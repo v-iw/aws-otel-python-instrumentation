@@ -1,0 +1,64 @@
+--- a/sitecustomize.py
++++ b/sitecustomize.py
+@@ -12,7 +12,7 @@
+ # older interpreters. The version gate below prevents execution on unsupported versions.
+ 
+ from os import environ, pathsep
+-from os.path import dirname, isfile, join, normpath
++from os.path import dirname, isdir, isfile, join, normpath
+ # sys is imported as a module, unlike everything else here, because
+ # _log_cannot_auto_instrument_warning probes it with hasattr: sys.argv is
+ # absent under some embedded interpreters, where "from sys import argv" would
+@@ -230,8 +230,35 @@
+     environ["PYTHON_AUTO_INSTRUMENTATION_AGENT_PATH_PREFIX"] = ""
+ 
+     path[:] = [entry for entry in path if normpath(entry) != normalized_site]
++
++
++def _adot_group_packages(current_site):
++    # ADOT patch 0005: package grouping (B2). build.sh moves every distribution that is not OpenTelemetry's or the
++    # ADOT distro's to <site>/deps, which goes at the end of sys.path, behind the application's site-packages: the
++    # application keeps its own versions of general libraries (urllib3, protobuf, requests, ...), which make no
++    # compatibility promise and which the SDK requires only loosely. The OpenTelemetry group stays ahead of them (patch
++    # 0002): the SDK needs the API version it was built with, and the API promises backward compatibility.
++    # PYTHONPATH is left alone; child processes run this file again.
++    deps = join(current_site, "deps")
++    if not isdir(deps):
++        return
++    normalized_deps = normpath(deps)
++    path[:] = [entry for entry in path if normpath(entry) != normalized_deps]
++    path.append(deps)
++    _log_debug("using general libraries from {}, after the application's".format(deps))
+ 
+ 
++def _adot_pin_opentelemetry_namespace():
++    # ADOT patch 0005: opentelemetry is a namespace package, whose __path__ is recomputed whenever sys.path changes.
++    # An application that later moves its own site-packages forward would then get every opentelemetry module not
++    # imported yet from its own copies, next to ours. Pinned to what it is now, with this site first.
++    try:
++        import opentelemetry
++        opentelemetry.__path__ = list(opentelemetry.__path__)
++    except Exception as e:
++        _log_debug("cannot pin the opentelemetry namespace: {}: {}".format(type(e).__name__, e))
++
++
+ def _normalized_package_name(name):
+     # PEP 503: runs of "-", "_" and "." collapse to a single "-", lowercased.
+     # importlib.metadata normalizes the name a distribution is looked up by, but
+@@ -568,6 +595,7 @@
+     _log_debug("checking for dependency conflicts")
+ 
+     path.insert(site_index, current_site)
++    _adot_group_packages(current_site)
+ 
+     version_conflicts = {}
+     requirements_to_check = _read_all_dependencies()
+@@ -589,6 +617,8 @@
+             _log_debug("importing and initializing the Python auto-instrumentation now")
+             # ADOT patch 0004: record the state initialization starts from, so that a failure can return to it.
+             _adot_hook("before_initialize")
++            # ADOT patch 0005: pinned after the state is recorded, so that a teardown removes the pinned namespace.
++            _adot_pin_opentelemetry_namespace()
+             from opentelemetry.instrumentation import auto_instrumentation
+             # swallow_exceptions=False is what makes the handler below reachable.
+             # initialize() defaults to logging any failure of the distro, the

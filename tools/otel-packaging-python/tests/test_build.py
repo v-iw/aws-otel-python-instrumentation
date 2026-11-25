@@ -6,7 +6,14 @@ import re
 import shutil
 import subprocess
 
-from conftest import AUTO_INSTRUMENTATION, TOOL_DIRECTORY, build_payload, supported_minors
+from conftest import (
+    AUTO_INSTRUMENTATION,
+    BUILD_SCRIPT,
+    TOOL_DIRECTORY,
+    build_payload,
+    supported_minors,
+    write_distribution,
+)
 
 
 def test_installs_the_shim_in_place_of_upstreams_sitecustomize(payload):
@@ -82,3 +89,43 @@ def test_refuses_a_payload_without_exactly_one_distro(payload):
     )
     assert result.returncode != 0
     assert "expected exactly one aws_opentelemetry_distro .dist-info, found 0" in result.stderr
+
+
+# Package grouping (B2): general libraries move to deps/, which the bootstrap puts behind the application's packages.
+def test_moves_general_libraries_out_of_the_payload_root(payload):
+    assert (payload / "deps" / "urllib3" / "__init__.py").is_file()
+    assert (payload / "deps" / "urllib3-2.8.0.dist-info" / "RECORD").is_file()
+    assert not (payload / "urllib3").exists()
+    assert not (payload / "urllib3-2.8.0.dist-info").exists()
+    for stem in ("opentelemetry_api-1.45.2", "opentelemetry_sdk-1.45.2", "aws_opentelemetry_distro-0.23.0"):
+        assert (payload / f"{stem}.dist-info").is_dir(), stem
+
+
+def _payload_with(tmp_path, stem, name, version, files):
+    root = tmp_path / "payload"
+    (root / AUTO_INSTRUMENTATION).mkdir(parents=True)
+    write_distribution(root, "opentelemetry_api-1.45.2", "opentelemetry-api", "1.45.2", {"opentelemetry/api.py": ""})
+    write_distribution(root, "aws_opentelemetry_distro-0.23.0", "aws-opentelemetry-distro", "0.23.0")
+    write_distribution(root, stem, name, version, files)
+    return root
+
+
+def _build(root):
+    return subprocess.run(["bash", str(BUILD_SCRIPT), str(root)], capture_output=True, text=True, check=False)
+
+
+def test_refuses_a_distribution_without_a_record(tmp_path):
+    root = _payload_with(tmp_path, "six-1.17.0", "six", "1.17.0", {"six.py": ""})
+    (root / "six-1.17.0.dist-info" / "RECORD").unlink()
+    result = _build(root)
+    assert result.returncode != 0
+    assert "six-1.17.0.dist-info: no RECORD" in result.stderr
+    assert not (root / "deps").exists()
+
+
+def test_refuses_an_entry_both_groups_install(tmp_path):
+    # A general library writing into the opentelemetry package could not be put behind the application's packages.
+    root = _payload_with(tmp_path, "intruder-1.0", "intruder", "1.0", {"opentelemetry/intruder.py": ""})
+    result = _build(root)
+    assert result.returncode != 0
+    assert "opentelemetry belong to both" in result.stderr

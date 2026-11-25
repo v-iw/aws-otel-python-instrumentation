@@ -51,17 +51,24 @@ print("STATE " + json.dumps({
 """
 
 PAYLOAD_DISTRIBUTIONS = {
-    "opentelemetry_api-1.45.2": ("opentelemetry-api", "1.45.2"),
-    "opentelemetry_sdk-1.45.2": ("opentelemetry-sdk", "1.45.2"),
-    "aws_opentelemetry_distro-0.23.0": ("aws-opentelemetry-distro", "0.23.0"),
-    "urllib3-2.8.0": ("urllib3", "2.8.0"),
+    "opentelemetry_api-1.45.2": ("opentelemetry-api", "1.45.2", None),
+    "opentelemetry_sdk-1.45.2": ("opentelemetry-sdk", "1.45.2", None),
+    "aws_opentelemetry_distro-0.23.0": ("aws-opentelemetry-distro", "0.23.0", None),
+    # A general library, which build.sh moves to deps/.
+    "urllib3-2.8.0": ("urllib3", "2.8.0", {"urllib3/__init__.py": "SOURCE = 'payload'\n"}),
 }
 
 
-def write_distribution(directory, dist_info_stem, name, version):
+def write_distribution(directory, dist_info_stem, name, version, files=None):
+    """Write an installed distribution's metadata; ``files`` maps paths it installs to their contents."""
     dist_info = Path(directory, dist_info_stem + ".dist-info")
     dist_info.mkdir(parents=True, exist_ok=True)
     (dist_info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n\n")
+    for relative, content in (files or {}).items():
+        Path(directory, relative).parent.mkdir(parents=True, exist_ok=True)
+        Path(directory, relative).write_text(content)
+    recorded = [*(files or {}), f"{dist_info.name}/METADATA", f"{dist_info.name}/RECORD"]
+    (dist_info / "RECORD").write_text("".join(f"{path},,\n" for path in recorded))
 
 
 def build_payload(root, tool_directory=TOOL_DIRECTORY):
@@ -76,8 +83,8 @@ def build_payload(root, tool_directory=TOOL_DIRECTORY):
     (auto_instrumentation / "sitecustomize.py").write_text(
         "raise AssertionError('upstream sitecustomize must be replaced')\n"
     )
-    for stem, (name, version) in PAYLOAD_DISTRIBUTIONS.items():
-        write_distribution(root, stem, name, version)
+    for stem, (name, version, files) in PAYLOAD_DISTRIBUTIONS.items():
+        write_distribution(root, stem, name, version, files)
     return subprocess.run(
         ["bash", str(tool_directory / "build.sh"), str(root)], capture_output=True, text=True, check=False
     )

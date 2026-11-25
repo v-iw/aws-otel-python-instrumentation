@@ -18,8 +18,22 @@ so that we track upstream instead of maintaining our own.
 | `patches/*.patch` | ADOT changes to the upstream file, applied in order |
 | `adot_sitecustomize.py` | Entry point the operator's `PYTHONPATH` loads; runs the bootstrap |
 | `adot_hooks.py` | What patch 0004 calls: the skip record, and the teardown after a failed initialization |
-| `build.sh` | Installs all of this into a payload; called by the root `Dockerfile` |
+| `build.sh` | Installs all of this into a payload and moves its general libraries to `deps/`; called by the root `Dockerfile` |
 | `tests/` | Tests for `build.sh`, the patched bootstrap, and the entry point |
+
+## Layout
+
+`build.sh` groups the payload `pip install --target` produces (package grouping, B2):
+
+- The **OpenTelemetry group** (`opentelemetry-*` and `aws-opentelemetry-distro`) stays at the payload root, which the
+  operator puts on `PYTHONPATH` ahead of the application's site-packages. The SDK needs the API version it was built
+  with, and the API promises backward compatibility, so the application's own OpenTelemetry code runs on ours.
+- **General libraries** (urllib3, requests, protobuf, wrapt, typing_extensions, ...) move to `<payload>/deps/`, which
+  the bootstrap puts at the end of `sys.path`, behind the application's site-packages. They make no compatibility
+  promise and the application depends on its own versions; the SDK's requirements on them are loose. An application
+  without its own copy uses ours.
+
+Distributions are grouped by their `RECORD`; a top-level entry both groups install fails the build.
 
 ## How it runs
 
@@ -35,7 +49,8 @@ The operator sets `PYTHONPATH=<payload>/opentelemetry/instrumentation/auto_instr
    on running as `__main__`: an `if __name__ == "__main__":` block would not run. The upstream file has none today, and
    the tests check that the bootstrap's top-level code runs (it initializes on a supported Python).
 3. The bootstrap checks the Python version, the OTLP protocol, and the payload's OpenTelemetry distributions
-   (`<payload>/cp3<minor>/all-dependencies.txt`), then calls `initialize(swallow_exceptions=False)`, which loads the ADOT
+   (`<payload>/cp3<minor>/all-dependencies.txt`), puts `<payload>/deps` at the end of `sys.path` (patch 0005), pins the
+   `opentelemetry` namespace, then calls `initialize(swallow_exceptions=False)`, which loads the ADOT
    distro. On a failed check or an initialization error it removes the payload from `sys.path` and `PYTHONPATH` and
    clears `PYTHON_AUTO_INSTRUMENTATION_AGENT_PATH_PREFIX`. Through patch 0004 it then calls `<payload>/_adot_hooks.py`
    (`adot_hooks.py`), which:
@@ -55,9 +70,10 @@ libraries are not listed, so the check does not change which applications are in
 | Patch | Change | Why |
 |---|---|---|
 | `0001` | The double-instrumentation check never deactivates; it reports at debug level (`OTEL_INJECTOR_LOG_LEVEL=debug`) | Applications commonly depend on OpenTelemetry packages without instrumenting themselves; Apache Airflow depends on `opentelemetry-exporter-otlp` |
-| `0002` | The payload goes back to its position on `sys.path` instead of the end | The ADOT image has always kept its packages ahead of the application's `site-packages`; moving it behind them changes which versions applications run with |
+| `0002` | The payload goes back to its position on `sys.path` instead of the end | The OpenTelemetry group must stay ahead of the application's `site-packages`: an application that brings `opentelemetry-api` (fastapi, anthropic, google-cloud libraries do) would otherwise give our SDK an API version it does not support. General libraries go behind them through patch 0005 instead |
 | `0003` | `OTEL_{TRACES,METRICS,LOGS}_EXPORTER` are not set | Upstream selects its own vendored exporters, which the ADOT payload does not contain; the ADOT distro sets its own defaults |
 | `0004` | Every skip names a reason code and goes through `_adot_hooks.py`; initialization is bracketed by hooks; the warning no longer carries `sys.argv` | The skip record and teardown below. Arguments can hold passwords |
+| `0005` | `<site>/deps` goes at the end of `sys.path`; the `opentelemetry` namespace's `__path__` is pinned before initialization | [Layout](#layout). A namespace package's path is recomputed when `sys.path` changes, so an application that moves its own site-packages forward after startup would get the OpenTelemetry modules not imported yet from its own copies |
 
 Each patch is a candidate for an upstream option; drop it here once upstream has one.
 
