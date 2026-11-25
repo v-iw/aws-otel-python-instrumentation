@@ -35,6 +35,10 @@ so that we track upstream instead of maintaining our own.
 
 Distributions are grouped by their `RECORD`; a top-level entry both groups install fails the build.
 
+`deps/` is placed at the end of `sys.path` once, at startup. A directory the application adds after that
+(`site.addsitedir`, `sys.path.append`) comes after it, so for that directory our general libraries still come first,
+as every payload package did before grouping.
+
 ## How it runs
 
 The operator sets `PYTHONPATH=<payload>/opentelemetry/instrumentation/auto_instrumentation:<customer entries>:<payload>`.
@@ -80,8 +84,12 @@ Each patch is a candidate for an upstream option; drop it here once upstream has
 ## Skip record
 
 Every Python process the operator reaches records its decision in `<payload>/.results/<container name>`, one line per
-process, keeping the last 50 lines. The OTel Injector writes the same lines with `layer=injector`; a reader takes the
-last line for a pid as the final decision. Writing is best effort: a record that cannot be written changes nothing.
+process, appended in a single `O_APPEND` write so that processes starting together lose no line. Once the file passes
+about 100 lines it is trimmed, under a lock, to the newest line per program and layer (at most 50), so that a frequent
+short-lived process such as an exec probe cannot push the main process's decision out. The OTel Injector writes the
+same lines with `layer=injector` and follows the same rules; a reader takes the last line for a pid as the final
+decision. `.results` is created writable by every user (mode 1777), because every injected container shares the
+emptyDir and can run as a different user. Writing is best effort: a record that cannot be written changes nothing.
 
 ```
 time=2026-11-24T21:59:44Z layer=sdk pid=1 program=/app/app.py language=python decision=skip reason=python_version_unsupported detail="unsupported Python version: 3.9.25 ..." env_removed=OTEL_PYTHON_DISTRO version=0.24.0
