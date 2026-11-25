@@ -59,7 +59,8 @@ def _report_skip(bundle_root, reason):
     except Exception:  # pylint: disable=broad-exception-caught
         pass
     try:
-        sys.stderr.write("[aws-instrumentation] SDK skipped: reason=bootstrap_error detail=%s\n" % reason)
+        detail = " ".join(reason.split()).replace("\\", "\\\\").replace('"', '\\"')
+        sys.stderr.write('[aws-instrumentation] SDK skipped: reason=bootstrap_error detail="%s"\n' % detail)
         sys.stderr.flush()
     except Exception:  # pylint: disable=broad-exception-caught
         pass

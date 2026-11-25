@@ -43,6 +43,8 @@ OPERATOR_ENV = {
 # it: initialization had already started everything when it raised.
 FAILING_INSTRUMENTOR = """
 import logging
+import threading
+import time
 
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 
@@ -57,6 +59,13 @@ class FailingInstrumentor(BaseInstrumentor):
         return []
 
     def _instrument(self, **kwargs):
+        # A thread that imports more of the SDK while it finishes, the way a final flush can: the teardown waits for
+        # it, and must remove what it imported meanwhile.
+        def import_late():
+            time.sleep(0.5)
+            import opentelemetry.instrumentation.zz_failing.late  # noqa: F401  (the application's, not ours)
+
+        threading.Thread(target=import_late).start()
         # Changes to logging that no uninstrument() undoes, the way a configurator makes them.
         logging.getLogger().addHandler(AddedDuringInitialization())
         logging.getLogger().setLevel(logging.DEBUG)
@@ -197,14 +206,64 @@ def test_record_and_stderr_never_carry_the_arguments(payload):
     assert "s3cr3t" not in (payload / ".results" / "app").read_text()
 
 
-def test_record_keeps_the_last_fifty_lines(payload):
+def _record(program, decision="inject", reason=None):
+    line = f"time=2026-11-25T00:00:00Z layer=sdk pid=1 program={program} language=python decision={decision}"
+    return line + (f" reason={reason}" if reason else "") + " version=0.23.0"
+
+
+# A frequent short-lived Python process (an exec probe, a helper script) appends a line on every start; trimming to the
+# last lines would push the main process's decision out of the file within minutes.
+def test_frequent_short_lived_processes_keep_the_main_process_decision(payload):
     (payload / ".results").mkdir()
-    (payload / ".results" / "app").write_text("".join(f"old line {number}\n" for number in range(60)))
+    main = _record("/app/main.py", "skip", "init_failed")
+    probes = [_record("/app/probe.py").replace("pid=1", f"pid={number}") for number in range(300)]
+    (payload / ".results" / "app").write_text("\n".join([main, *probes]) + "\n")
     run_python(operator_pythonpath(payload), {CONTAINER: "k8s.container.name=app"})
     lines = (payload / ".results" / "app").read_text().splitlines()
-    assert len(lines) == 50
-    assert lines[0] == "old line 11"
+    # The newest line of each program, oldest first: the main process, the probe, and this process.
+    assert lines[:2] == [main, probes[-1]]
+    assert len(lines) == 3
     assert "decision=inject" in lines[-1]
+
+
+def test_trimming_keeps_the_newest_fifty_programs(payload):
+    (payload / ".results").mkdir()
+    lines = [_record(f"/app/helper-{number}.py") for number in range(300)]
+    (payload / ".results" / "app").write_text("\n".join(lines) + "\n")
+    run_python(operator_pythonpath(payload), {CONTAINER: "k8s.container.name=app"})
+    kept = (payload / ".results" / "app").read_text().splitlines()
+    assert len(kept) == 50
+    assert kept[:49] == lines[-49:]
+
+
+def test_short_file_is_only_appended_to(payload):
+    (payload / ".results").mkdir()
+    existing = [_record("/app/main.py")] * 3
+    (payload / ".results" / "app").write_text("\n".join(existing) + "\n")
+    run_python(operator_pythonpath(payload), {CONTAINER: "k8s.container.name=app"})
+    assert (payload / ".results" / "app").read_text().splitlines()[:3] == existing
+
+
+# Workers of a pre-fork server, or several helpers, start at the same moment; rewriting the file lost all but one line.
+def test_processes_starting_together_lose_no_line(payload):
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": operator_pythonpath(payload),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        CONTAINER: "k8s.container.name=app",
+    }
+    processes = [
+        subprocess.Popen([sys.executable, "-c", "pass"], env=environment, stderr=subprocess.DEVNULL) for _ in range(20)
+    ]
+    for process in processes:
+        assert process.wait() == 0
+    assert len((payload / ".results" / "app").read_text().splitlines()) == 20
+
+
+def test_results_directory_is_writable_by_every_container_user(payload):
+    # The emptyDir is shared by every container the operator injects, which can run as different users.
+    run_python(operator_pythonpath(payload), {CONTAINER: "k8s.container.name=app"})
+    assert (payload / ".results").stat().st_mode & 0o7777 == 0o1777
 
 
 def test_container_name_falls_back_to_the_command_line_hash(payload):
@@ -361,6 +420,7 @@ def _failing_instrumentor_site(tmp_path):
     package = site / "opentelemetry" / "instrumentation" / "zz_failing"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text(FAILING_INSTRUMENTOR)
+    (package / "late.py").write_text("")
     return site
 
 

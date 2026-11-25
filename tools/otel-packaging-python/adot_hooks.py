@@ -36,7 +36,10 @@ SDK_VERSION = "unknown"  # sdk-version
 LAYER = "sdk"
 LANGUAGE = "python"
 RESULTS_DIRECTORY_NAME = ".results"
+# Once the file is larger than RESULTS_TRIM_BYTES (about 100 lines), it is trimmed to the newest line per program and
+# layer, and to at most RESULTS_KEEP_LINES of those. Only its size is checked on every start: most starts only append.
 RESULTS_KEEP_LINES = 50
+RESULTS_TRIM_BYTES = 20000
 DETAIL_MAX_LENGTH = 200
 STDERR_PREFIX = "[aws-instrumentation]"
 
@@ -163,45 +166,80 @@ def _record_line(decision, code=None, detail=None, removed_variables=None):
     return " ".join("%s=%s" % (key, _field(value)) for key, value in fields)
 
 
-def _text(value):
-    # io.open writes text only. Python 2 str and Python 3 bytes are byte strings (bytes is str on Python 2); joined
-    # with text below, the result is text on both.
-    if isinstance(value, bytes):
-        return value.decode("utf-8", "replace")
-    return value
+def _record_key(line):
+    # The line's program and layer: trimming keeps the newest line of each, so that a frequent short-lived process (an
+    # exec probe, a helper script) cannot push the main process's decision out of the file.
+    import re  # only when trimming: most processes never pay for it
+
+    fields = {}
+    for match in re.finditer(r'(program|layer)=("(?:[^"\\]|\\.)*"|\S*)', line):
+        fields[match.group(1)] = match.group(2)
+    if "program" not in fields:
+        return line
+    return (fields["program"], fields.get("layer"))
+
+
+def _trim(lines):
+    newest = {}
+    for index, line in enumerate(lines):
+        newest[_record_key(line)] = index
+    kept = sorted(newest.values())[-RESULTS_KEEP_LINES:]
+    return [lines[index] for index in kept]
+
+
+def _lock(descriptor, exclusive):
+    try:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    except Exception:
+        pass
 
 
 def _append_record(line, name=None):
-    temporary = None
     try:
         directory = os.path.join(BUNDLE_ROOT, RESULTS_DIRECTORY_NAME)
         try:
+            # Shared by every container the operator injects, which can run as different users: writable by all,
+            # like /tmp. It lives in the pod's own emptyDir.
             os.mkdir(directory)
+            os.chmod(directory, 0o1777)
         except OSError:
             pass
         path = os.path.join(directory, name or container_name())
-        lines = []
+        data = (line + "\n").encode("utf-8") if not isinstance(line, bytes) else line + b"\n"
+        # Appended in one write with O_APPEND, which the kernel keeps whole when processes start at the same moment.
+        # A shared lock lets a trim (below) finish first, so that no line lands in a file being rewritten.
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
         try:
-            with io.open(path, "r", encoding="utf-8", errors="replace") as results:
-                lines = results.read().splitlines()
-        except Exception:
-            pass
-        lines.append(_text(line))
-        # Written whole and renamed into place, so a reader never sees a partial line. Two processes writing at the
-        # same moment can drop one of their lines; the record is best effort.
-        temporary = "%s.%d.tmp" % (path, os.getpid())
-        with io.open(temporary, "w", encoding="utf-8") as results:
-            results.write("\n".join(lines[-RESULTS_KEEP_LINES:]) + "\n")
-        os.rename(temporary, path)
-        temporary = None
+            _lock(descriptor, exclusive=False)
+            os.write(descriptor, data)
+        finally:
+            os.close(descriptor)
+        if os.path.getsize(path) > RESULTS_TRIM_BYTES:
+            _trim_file(path)
     except Exception:
         pass
+
+
+def _trim_file(path):
+    # Rewritten in place under an exclusive lock, so that appenders wait and then append to the same file.
+    descriptor = os.open(path, os.O_RDWR)
+    try:
+        _lock(descriptor, exclusive=True)
+        content = b""
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            content += chunk
+        lines = content.decode("utf-8", "replace").splitlines()
+        kept = ("\n".join(_trim(lines)) + "\n").encode("utf-8")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.write(descriptor, kept)
+        os.ftruncate(descriptor, len(kept))
     finally:
-        if temporary is not None:
-            try:
-                os.remove(temporary)
-            except Exception:
-                pass
+        os.close(descriptor)
 
 
 def _write_stderr(line):
@@ -628,7 +666,8 @@ def _teardown(snapshot):
     _attempt(_restore_interpreter, snapshot)
     _attempt(_restore_environ, snapshot)
     # 6. Our modules, so that the application imports its own copies (or none). Decided first, then removed.
-    _attempt(_remove_modules, module_names)
+    # Decided again now: the threads joined above can have imported more of ours while they finished.
+    _attempt(_remove_modules, _new_modules(snapshot))
     try:
         import importlib
 

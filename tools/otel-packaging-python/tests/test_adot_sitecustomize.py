@@ -109,3 +109,15 @@ def test_old_interpreters_start_without_the_payload(payload, tmp_path, version):
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["application", "[]", "'/app'"]
     assert f"unsupported Python version: {version}" in result.stderr
+
+
+def test_fallback_line_quotes_the_detail_like_the_hooks(payload):
+    # Without the hooks either, the shim writes the line itself, in the same key=value format.
+    (payload / "_otel_packaging_sitecustomize.py").unlink()
+    (payload / "_adot_hooks.py").unlink()
+    _, stderr = run_python(operator_pythonpath(payload))
+    assert stderr.startswith(
+        "[aws-instrumentation] SDK skipped: reason=bootstrap_error "
+        'detail="cannot run _otel_packaging_sitecustomize.py: FileNotFoundError:'
+    )
+    assert stderr.rstrip().endswith('"')
