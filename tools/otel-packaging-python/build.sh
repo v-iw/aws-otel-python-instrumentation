@@ -10,6 +10,8 @@
 #       Python version allowlist set to SUPPORTED_PYTHON_MINORS.
 #   <payload>/opentelemetry/instrumentation/auto_instrumentation/sitecustomize.py
 #       adot_sitecustomize.py, replacing upstream's.
+#   <payload>/_adot_hooks.py
+#       adot_hooks.py, which patch 0004 calls: the skip record, and the teardown after a failed initialization.
 #   <payload>/cp3<minor>/all-dependencies.txt, for every supported minor
 #       The payload's OpenTelemetry distributions, pinned, for the bootstrap's dependency-conflict check.
 #
@@ -67,6 +69,25 @@ EOF
 
 install -m 0644 "$work/sitecustomize.py" "$payload/_otel_packaging_sitecustomize.py"
 install -m 0644 "$here/adot_sitecustomize.py" "$auto_instrumentation/sitecustomize.py"
+
+# The hooks patch 0004 calls, with the payload's ADOT distro version written into the skip record's version field.
+python3 - "$here/adot_hooks.py" "$payload" "$work/adot_hooks.py" <<'EOF'
+import os, re, sys
+source, payload, target = sys.argv[1:]
+versions = [entry[len("aws_opentelemetry_distro-"):-len(".dist-info")] for entry in os.listdir(payload)
+            if entry.startswith("aws_opentelemetry_distro-") and entry.endswith(".dist-info")]
+if len(versions) != 1:
+    sys.exit("%s: expected exactly one aws_opentelemetry_distro .dist-info, found %d" % (payload, len(versions)))
+with open(source, encoding="utf-8") as f:
+    text = f.read()
+pattern = re.compile(r'^SDK_VERSION = "[^"]*"  # sdk-version$', re.MULTILINE)
+if len(pattern.findall(text)) != 1:
+    sys.exit("%s: expected exactly one sdk-version marker" % source)
+text = pattern.sub('SDK_VERSION = "%s"  # sdk-version' % versions[0], text)
+with open(target, "w", encoding="utf-8") as f:
+    f.write(text)
+EOF
+install -m 0644 "$work/adot_hooks.py" "$payload/_adot_hooks.py"
 
 # Only the OpenTelemetry distributions are listed. The bundle's copies of them must be the ones in effect, because the
 # SDK pins the exact API version it was built with; general-purpose libraries are left out, so this check does not

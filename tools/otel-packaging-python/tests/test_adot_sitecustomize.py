@@ -54,7 +54,10 @@ def test_deactivates_when_the_bootstrap_is_missing(payload):
     (payload / "_otel_packaging_sitecustomize.py").unlink()
     state, stderr = run_python(operator_pythonpath(payload))
     assert not state["initialized"]
-    assert "cannot auto-instrument Python process: cannot run" in stderr
+    assert stderr.startswith(
+        "[aws-instrumentation] SDK skipped: reason=bootstrap_error "
+        'detail="cannot run _otel_packaging_sitecustomize.py: FileNotFoundError:'
+    )
     assert _entries_inside(state["sys_path"], payload) == []
     assert state["pythonpath"] == ""
     assert state["prefix"] == ""

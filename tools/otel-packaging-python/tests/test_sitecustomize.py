@@ -6,7 +6,8 @@ patches: the decisions it makes in a process started the way the operator starts
 import re
 import sys
 
-from conftest import operator_pythonpath, run_python, write_distribution
+import pytest
+from conftest import operator_pythonpath, read_records, run_python, write_distribution
 
 
 def _bundle_entries(state, payload):
@@ -109,3 +110,78 @@ def test_general_library_shadowed_by_an_earlier_entry_does_not_deactivate(payloa
     state, stderr = run_python(operator_pythonpath(payload, vendor))
     assert state["initialized"]
     assert "cannot auto-instrument" not in stderr
+
+
+# ADOT patch 0004: every path that leaves the process uninstrumented names its reason code, for the skip record the
+# agent reads and for the one stderr line.
+def _narrow_allowlist(payload, _tmp_path):
+    bootstrap = payload / "_otel_packaging_sitecustomize.py"
+    text = re.sub(r"_SUPPORTED_PYTHON_MINORS = \([0-9, ]*\)", "_SUPPORTED_PYTHON_MINORS = (99,)", bootstrap.read_text())
+    bootstrap.write_text(text)
+    return [], {}
+
+
+def _unusable_config_file(payload, tmp_path):
+    # The bootstrap validates the file with otel-config-check next to the bundle, which the Injector layout ships and
+    # the ADOT image does not; a stand-in that rejects every file.
+    validator = payload.parent / "otel-config-check"
+    validator.write_text("#!/bin/sh\necho 'file_format is missing'\nexit 1\n")
+    validator.chmod(0o755)
+    return [], {"OTEL_CONFIG_FILE": str(tmp_path / "config.yaml")}
+
+
+def _unsupported_protocol(_payload, _tmp_path):
+    return [], {"OTEL_EXPORTER_OTLP_PROTOCOL": "http/json"}
+
+
+def _missing_dependency_list(payload, _tmp_path):
+    (payload / f"cp3{sys.version_info[1]}" / "all-dependencies.txt").unlink()
+    return [], {}
+
+
+def _shadowed_api(_payload, tmp_path):
+    vendor = tmp_path / "vendor"
+    write_distribution(vendor, "opentelemetry_api-1.27.0", "opentelemetry-api", "1.27.0")
+    return [vendor], {}
+
+
+def _failing_initialization(_payload, _tmp_path):
+    return [], {"FAKE_INITIALIZE": "raise"}
+
+
+def _broken_packaging_library(_payload, tmp_path):
+    # Any error the checks do not handle themselves: here, the packaging library raising on import.
+    broken = tmp_path / "broken" / "packaging"
+    broken.mkdir(parents=True)
+    (broken / "__init__.py").write_text("raise RuntimeError('broken packaging library')\n")
+    return [broken.parent], {}
+
+
+@pytest.mark.parametrize(
+    "setup, code",
+    [
+        (_narrow_allowlist, "python_version_unsupported"),
+        (_unusable_config_file, "config_file_invalid"),
+        (_unsupported_protocol, "otlp_protocol_unsupported"),
+        (_missing_dependency_list, "payload_incomplete"),
+        (_shadowed_api, "dependency_conflict"),
+        (_failing_initialization, "init_failed"),
+        (_broken_packaging_library, "bootstrap_error"),
+    ],
+)
+def test_every_skip_names_its_reason_code(payload, tmp_path, setup, code):
+    customer_entries, extra_env = setup(payload, tmp_path)
+    extra_env["OTEL_RESOURCE_ATTRIBUTES"] = "k8s.container.name=app"
+    state, stderr = run_python(operator_pythonpath(payload, *customer_entries), extra_env)
+    assert _bundle_entries(state, payload) == []
+    assert stderr.splitlines()[-1].startswith(f"[aws-instrumentation] SDK skipped: reason={code} detail=")
+    assert [record["reason"] for record in read_records(payload)["app"]] == [code]
+
+
+def test_skip_without_the_hooks_still_warns_without_the_arguments(payload):
+    # A payload without _adot_hooks.py changes no decision: upstream's warning, minus the command line.
+    (payload / "_adot_hooks.py").unlink()
+    state, stderr = run_python(operator_pythonpath(payload), {"FAKE_INITIALIZE": "raise"}, args=["--password=s3cr3t"])
+    assert _bundle_entries(state, payload) == []
+    assert "cannot auto-instrument Python process: error when importing/initializing" in stderr
+    assert "s3cr3t" not in stderr

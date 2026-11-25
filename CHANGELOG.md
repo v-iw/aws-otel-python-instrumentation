@@ -14,6 +14,11 @@ If your change does not need a CHANGELOG entry, add the "skip changelog" label t
 - fix: the operator auto-instrumentation image skips auto-instrumentation instead of breaking the application when it
   cannot start safely, for example on Python older than 3.10, using the OpenTelemetry Packaging bootstrap
   ([#986](https://github.com/aws-observability/aws-otel-python-instrumentation/pull/986))
+- fix: when auto-instrumentation in the operator image fails to initialize, it now undoes everything it started
+  (instrumentation patches, SDK threads and providers, ServiceEvents, Dynamic Instrumentation, import hooks and its
+  modules) so the application runs as if it was never injected; every skip is recorded with a reason code in
+  `.results/<container>` and one `[aws-instrumentation]` stderr line, and removes the operator's variables
+  ([#TBD](https://github.com/aws-observability/aws-otel-python-instrumentation/pull/TBD))
 
 ## v0.24.0 - 2026-11-20
 - fix(langchain): report `stop` / `tool_call` / `length` instead of the raw Responses API status (`completed`)

@@ -67,3 +67,18 @@ def test_refuses_a_directory_that_is_not_an_installed_payload(tmp_path):
     )
     assert result.returncode != 0
     assert "not an installed ADOT Python payload" in result.stderr
+
+
+def test_installs_the_hooks_with_the_payloads_distro_version(payload):
+    hooks = (payload / "_adot_hooks.py").read_text()
+    source = (TOOL_DIRECTORY / "adot_hooks.py").read_text()
+    assert hooks == source.replace('SDK_VERSION = "unknown"  # sdk-version', 'SDK_VERSION = "0.23.0"  # sdk-version')
+
+
+def test_refuses_a_payload_without_exactly_one_distro(payload):
+    shutil.rmtree(payload / "aws_opentelemetry_distro-0.23.0.dist-info")
+    result = subprocess.run(
+        ["bash", str(TOOL_DIRECTORY / "build.sh"), str(payload)], capture_output=True, text=True, check=False
+    )
+    assert result.returncode != 0
+    assert "expected exactly one aws_opentelemetry_distro .dist-info, found 0" in result.stderr

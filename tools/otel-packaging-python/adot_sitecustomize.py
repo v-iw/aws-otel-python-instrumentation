@@ -9,7 +9,8 @@
 # runs the OpenTelemetry Packaging bootstrap (<bundle>/_otel_packaging_sitecustomize.py, see README.md), which checks
 # whether auto-instrumentation can start in this process and, if it cannot, removes the bundle root from sys.path and
 # PYTHONPATH. This file then removes its own directory too, which only the operator adds, so that the application and
-# its child processes run as if auto-instrumentation were not injected.
+# its child processes run as if auto-instrumentation were not injected. The bootstrap reports a skip through
+# <bundle>/_adot_hooks.py (adot_hooks.py); when the bootstrap cannot run at all, this file reports it the same way.
 #
 # IMPORTANT: this file must stay valid Python 2.7 so that older interpreters can run it, use only the standard library,
 # and never raise.
@@ -20,6 +21,7 @@ import os
 import sys
 
 BUNDLE_BOOTSTRAP_NAME = "_otel_packaging_sitecustomize.py"
+HOOKS_NAME = "_adot_hooks.py"
 INJECTOR_PREFIX_VARIABLE = "PYTHON_AUTO_INSTRUMENTATION_AGENT_PATH_PREFIX"
 
 
@@ -44,16 +46,29 @@ def _remove_bundle_entries(bundle_root):
         os.environ["PYTHONPATH"] = os.pathsep.join(entries)
 
 
-def _deactivate(bundle_root, reason):
-    _remove_bundle_entries(bundle_root)
-    os.environ[INJECTOR_PREFIX_VARIABLE] = ""
+def _report_skip(bundle_root, reason):
+    # Through the same hooks the bootstrap uses (<bundle>/_adot_hooks.py): the skip record, the stderr line, and the
+    # removal of the operator's variables. If they cannot run either, the stderr line alone.
     try:
-        sys.stderr.write(
-            "[opentelemetry-python-autoinstrumentation] WARNING: cannot auto-instrument Python process: %s\n" % reason
-        )
+        hooks_file = os.path.join(bundle_root, HOOKS_NAME)
+        namespace = {"__name__": "_adot_hooks", "__file__": hooks_file}
+        with open(hooks_file, "rb") as hooks_source:
+            exec(compile(hooks_source.read(), hooks_file, "exec"), namespace)  # pylint: disable=exec-used
+        if namespace["skip"]("bootstrap_error", reason):
+            return
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+    try:
+        sys.stderr.write("[aws-instrumentation] SDK skipped: reason=bootstrap_error detail=%s\n" % reason)
         sys.stderr.flush()
     except Exception:  # pylint: disable=broad-exception-caught
         pass
+
+
+def _deactivate(bundle_root, reason):
+    _remove_bundle_entries(bundle_root)
+    os.environ[INJECTOR_PREFIX_VARIABLE] = ""
+    _report_skip(bundle_root, reason)
 
 
 def run():
@@ -69,7 +84,7 @@ def run():
         namespace = {"__name__": "_otel_packaging_sitecustomize", "__file__": bootstrap}
         exec(code, namespace)  # pylint: disable=exec-used
     except Exception as error:  # pylint: disable=broad-exception-caught
-        _deactivate(bundle_root, "cannot run %s: %s: %s" % (bootstrap, type(error).__name__, error))
+        _deactivate(bundle_root, "cannot run %s: %s: %s" % (BUNDLE_BOOTSTRAP_NAME, type(error).__name__, error))
         return
     if not any(_same_entry(entry, bundle_root) for entry in sys.path):
         # The bootstrap deactivated auto-instrumentation and already logged why.

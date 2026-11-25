@@ -1,0 +1,121 @@
+--- a/sitecustomize.py
++++ b/sitecustomize.py
+@@ -177,13 +177,35 @@
+ _log_debug("PYTHONPATH: {}".format(environ.get("PYTHONPATH")))
+ 
+ 
+-def _log_cannot_auto_instrument_warning(reason):
+-    if hasattr(sys, "argv"):
+-        _log_warn("cannot auto-instrument Python process: {} [{}]".format(reason, " ".join(sys.argv)))
+-    else:
+-        _log_warn("cannot auto-instrument Python process: {}".format(reason))
++# ADOT patch 0004: hooks into ADOT's _adot_hooks.py, installed next to this file. It writes the skip record (A6) and
++# the stderr line, removes the variables the operator set, and undoes a failed initialization (B4). It is loaded the
++# way the shim loads this file (compiled from its path, not imported), so that it works on every interpreter this
++# file reaches and whether or not this directory is still on sys.path. A missing or failing hook changes no decision.
++_adot_hooks = None
+ 
+ 
++def _adot_hook(name, *args):
++    global _adot_hooks
++    try:
++        if _adot_hooks is None:
++            hooks_file = join(dirname(__file__), "_adot_hooks.py")
++            namespace = {"__name__": "_adot_hooks", "__file__": hooks_file}
++            with open(hooks_file, "rb") as hooks_source:
++                exec(compile(hooks_source.read(), hooks_file, "exec"), namespace)
++            _adot_hooks = namespace
++        return _adot_hooks[name](*args)
++    except Exception:
++        return None
++
++
++def _log_cannot_auto_instrument_warning(reason, code="bootstrap_error"):
++    # ADOT patch 0004: every caller names its reason code, and the line no longer carries sys.argv, whose arguments
++    # can hold passwords.
++    if _adot_hook("skip", code, reason):
++        return
++    _log_warn("cannot auto-instrument Python process: {}".format(reason))
++
++
+ def _self_deactivate(current_site):
+     # Starting child processes is quite common in Python (e.g. gunicorn etc.), and in particular,
+     # the OpenTelemetry instrumentation wrapper (opentelemetry-instrument python app.py) does this.
+@@ -464,7 +486,7 @@
+     _SUPPORTED_PYTHON_MINORS = (10, 11, 12, 13,)  # supported-python-minors
+     if version_info[0] != 3 or version_info[1] not in _SUPPORTED_PYTHON_MINORS:
+         _self_deactivate(current_site)
+-        _log_cannot_auto_instrument_warning("unsupported Python version: {}".format(version))
++        _log_cannot_auto_instrument_warning("unsupported Python version: {}".format(version), "python_version_unsupported")
+         return
+     _log_debug("found eligible Python version: {}".format(version_info))
+ 
+@@ -496,7 +518,7 @@
+             _self_deactivate(current_site)
+             _log_cannot_auto_instrument_warning(
+                 "the configuration file set via OTEL_CONFIG_FILE ({}) is not usable: {}".format(
+-                    config_file, validation_error))
++                    config_file, validation_error), "config_file_invalid")
+             return
+     else:
+         _log_debug("checking the OTLP protocol of each signal")
+@@ -512,7 +534,8 @@
+                 _self_deactivate(current_site)
+                 _log_cannot_auto_instrument_warning(
+                     "{}={} is not supported. "
+-                    "This package supports grpc and http/protobuf.".format(variable, otlp_protocol)
++                    "This package supports grpc and http/protobuf.".format(variable, otlp_protocol),
++                    "otlp_protocol_unsupported",
+                 )
+                 return
+             exporter_by_signal[signal] = exporter
+@@ -550,7 +573,8 @@
+     requirements_to_check = _read_all_dependencies()
+     if requirements_to_check is None:
+         _self_deactivate(current_site)
+-        _log_cannot_auto_instrument_warning("cannot read all-dependencies.txt for dependency conflict checking")
++        _log_cannot_auto_instrument_warning(
++            "cannot read all-dependencies.txt for dependency conflict checking", "payload_incomplete")
+         return
+ 
+     # Check every requirement, not just up to the first conflict.
+@@ -563,6 +587,8 @@
+         # and only if these are still unset.
+         try:
+             _log_debug("importing and initializing the Python auto-instrumentation now")
++            # ADOT patch 0004: record the state initialization starts from, so that a failure can return to it.
++            _adot_hook("before_initialize")
+             from opentelemetry.instrumentation import auto_instrumentation
+             # swallow_exceptions=False is what makes the handler below reachable.
+             # initialize() defaults to logging any failure of the distro, the
+@@ -573,14 +599,19 @@
+             # opentelemetry-instrumentation 0.55b0.
+             auto_instrumentation.initialize(swallow_exceptions=False)
+         except Exception as e:
++            # ADOT patch 0004: initialization can fail after it patched libraries, started threads and installed
++            # providers. Undo all of it before deactivating, so the application runs as if it was never injected.
++            _adot_hook("initialize_failed")
+             _self_deactivate(current_site)
+             _log_cannot_auto_instrument_warning(
+                 "error when importing/initializing Python OpenTelemetry auto-instrumentation: {}: {}".format(
+-                    type(e).__name__, e))
++                    type(e).__name__, e), "init_failed")
++        else:
++            _adot_hook("initialize_succeeded")
+     else:
+         _self_deactivate(current_site)
+         _log_cannot_auto_instrument_warning(
+-            "dependency conflicts: {}".format(_render_version_conflicts(version_conflicts)))
++            "dependency conflicts: {}".format(_render_version_conflicts(version_conflicts)), "dependency_conflict")
+ 
+ 
+ # Every guard above exists to leave the process in a known state, and an
+@@ -595,7 +626,7 @@
+     try:
+         _log_cannot_auto_instrument_warning(
+             "unexpected error while deciding whether to auto-instrument: {}: {}".format(
+-                type(unexpected_error).__name__, unexpected_error))
++                type(unexpected_error).__name__, unexpected_error), "bootstrap_error")
+     except Exception:
+         pass
+     try:
